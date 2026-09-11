@@ -1,0 +1,5 @@
+{
+    "scripts": {
+      "demo": "yarn --cwd .. start"
+    }
+  }

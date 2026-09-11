@@ -1,0 +1,2688 @@
+openapi: "3.0.3"
+info:
+  title: InsightUBC
+  description: >
+    InsightUBC enables UBC administrators and researchers to analyze historical course offering data.
+
+    **Notes:**
+
+    - Integer fields are validated according to ECMA Script [isInteger](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Number/isInteger) specification.
+
+    - IDs are case-sensitive.
+
+  version: "2.0.3"
+servers:
+  - url: http://localhost:4321
+    description: Local development server
+paths:
+  /api/v1/datasets:
+    post:
+      deprecated: true
+      summary: Bulk upload data
+      description: |-
+        Deprecated. Use /api/v2/datasets.
+
+        Upload a zip archive for asynchronous processing.
+        The data is normalized and added to existing resources in the system.
+
+        #### Uploading Course Offerings
+
+        To bulk upload course offerings (combined course and section data flattened into a single record), make a multipart request with:
+        1. The `kind` field set to "course_offerings".
+        2. The `archive` field set to a zip file with:
+           - a root directory named `courses/`
+           - one or more JSON files inside `courses/` (file names are arbitrary)
+           - each JSON file has a `result` property whose value is an array of objects with the following partial schema of fields that must be present together with their expected type:
+
+             ```
+             {
+               id: string,
+               Course: string,
+               Title: string,
+               Professor: string,
+               Subject: string,
+               Section: string,
+               Year: string,
+               Avg: number,
+               Pass: number,
+               Fail: number,
+               Audit: number
+             }
+             ```
+
+        Once the upload is complete, the system asynchronously processes the uploaded archive. The upload job is tracked with a unique `id` that you can use to query the job status via the `GET /api/v1/datasets/{id}` endpoint. The processing follows these steps:
+
+        1. **Validate zip format:** The uploaded file is verified to be a valid zip archive. If not, the job status is set to `failed` with message `"Data is not in a valid zip format"`.
+
+        2. **Check for courses/ directory:** The system checks for the existence of a root `courses/` directory within the archive. If missing, the job status is set to `failed` with message `"Missing root courses directory"`.
+
+        3. **Process files in courses/ directory:** For each file in the `courses/` directory:
+           - If the file is valid JSON with a `result` property, each course offering object in the `result` array is processed according to the rules below.
+           - If the file is not valid JSON or does not have a `result` property, the file is skipped.
+
+        4. **Load records into resources:** For each `result` object that is processed, the following rules apply:
+
+           **Courses:** the course `id` is set to `Subject` + `Course` (the concatenation of the field values).
+           - If the course does not exist, create a new course with:
+             - `code` set to the offering's `Course` field
+             - `title` set to the **most recent** offering's `Title` field
+             - `dept` set to the offering's `Subject` field
+
+           - If the course exists, update it only if any field value in the mapping above differs from the current resource.
+
+           **Sections:** the section `id` is set to the course offering `id`.
+           - If the section does not exist, create a new section under the course with:
+             - `instructor` set to the offering's `Professor` field
+             - `year` set to the offering's `Year` field, converted to a number (or 1900 when the offering's `Section` field equals "overall")
+             - `avg` set to the offering's `Avg` field
+             - `pass` set to the offering's `Pass` field
+             - `fail` set to the offering's `Fail` field
+             - `audit` set to the offering's `Audit` field
+
+           - If the section exists, update it only if any field value in the mapping above differs from the current resource.
+
+           **A record will not be processed if any of the following conditions are met:**
+             - A required field listed in the above schema is missing
+             - A required field's value cannot be converted to the expected type
+
+
+           **Note:** Courses are processed before sections to ensure every section's parent course exists before the section is created or updated.
+
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - kind
+                - archive
+              properties:
+                kind:
+                  type: string
+                  enum: ["course_offerings"]
+                  description: The type of data contained in the archive.
+                archive:
+                  type: string
+                  format: binary
+                  description: A zip file containing the data to upload.
+            encoding:
+              archive:
+                contentType: application/zip
+            examples:
+              courseOfferingsUpload:
+                summary: Upload course offerings
+                description: Example multipart request uploading a zip file containing course offering data.
+                value:
+                  kind: "course_offerings"
+                  archive: "[binary zip file contents]"
+      responses:
+        "202":
+          description: Upload accepted and is being processed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    description: Unique identifier for this upload job
+                  status:
+                    type: string
+                    enum: ["processing"]
+                  kind:
+                    type: string
+                    enum: ["course_offerings"]
+                    description: The type of data in this upload
+                  message:
+                    type: string
+                    enum: ["Dataset accepted for processing"]
+              example:
+                id: "upload_12345"
+                status: "processing"
+                kind: "course_offerings"
+                message: "Dataset accepted for processing"
+        "422":
+          description: Validation failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    enum: ["Validation failed"]
+                  fields:
+                    type: object
+                    properties:
+                      kind:
+                        type: string
+                        enum: ["required but missing", "expected to be course_offerings"]
+                      archive:
+                        type: string
+                        enum:
+                          [
+                            "required but missing",
+                            "expected non-empty file"
+                          ]
+              example:
+                error: "Validation failed"
+                fields:
+                  kind: "expected to be course_offerings"
+                  archive: "expected non-empty file"
+
+  /api/v1/datasets/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Dataset upload job identifier
+    get:
+      deprecated: true
+      summary: Retrieve upload statistics
+      description: |-
+        Deprecated. Use /api/v2/datasets/{id}.
+
+        Retrieve the status and statistics of a dataset upload job. The status reflects the current processing state:
+        - `processing`: The job is currently being processed according to the steps defined in the POST endpoint.
+        - `completed`: The job finished successfully. File statistics show how many files were processed vs skipped. Resource statistics show how many resources were created or modified during processing.
+        - `failed`: The job encountered a fatal error during validation. Check the `message` field for details (e.g., "Data is not in a valid zip format" or "Missing root courses directory").
+
+      responses:
+        "200":
+          description: Upload job status retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    description: Unique identifier for this upload job
+                  status:
+                    type: string
+                    enum: ["processing", "completed", "failed"]
+                    description: Current status of the upload job
+                  kind:
+                    type: string
+                    enum: ["course_offerings"]
+                    description: The type of data that was uploaded
+                  stats:
+                    description: Kind-specific statistics for the upload job. Values will be 0 until processing is `completed`.
+                    oneOf:
+                      - $ref: "#/components/schemas/CourseOfferingsUploadStats"
+                  message:
+                    type: string
+                    description: Human-readable status message
+                    enum: ["Processing in progress", "Dataset processing complete", "Data is not in a valid zip format", "Missing root courses directory"]
+              examples:
+                CompletedStatus:
+                  summary: Job completed successfully
+                  value:
+                    id: "upload_12345"
+                    status: "completed"
+                    kind: "course_offerings"
+                    stats:
+                      files_total: 12
+                      files_processed: 10
+                      files_skipped: 2
+                      courses_seen: 50
+                      courses_added: 47
+                      courses_modified: 3
+                      sections_seen: 1612
+                      sections_added: 1523
+                      sections_modified: 89
+                    message: "Dataset processing complete"
+                FailedStatus:
+                  summary: Job failed during validation
+                  value:
+                    id: "upload_12346"
+                    status: "failed"
+                    kind: "course_offerings"
+                    stats:
+                      files_total: 0
+                      files_processed: 0
+                      files_skipped: 0
+                      courses_seen: 0
+                      courses_added: 0
+                      courses_modified: 0
+                      sections_seen: 0
+                      sections_added: 0
+                      sections_modified: 0
+                    message: "Data is not in a valid zip format"
+                ProcessingStatus:
+                  summary: Job still processing
+                  value:
+                    id: "upload_12347"
+                    status: "processing"
+                    kind: "course_offerings"
+                    stats:
+                      files_total: 0
+                      files_processed: 0
+                      files_skipped: 0
+                      courses_seen: 0
+                      courses_added: 0
+                      courses_modified: 0
+                      sections_seen: 0
+                      sections_added: 0
+                      sections_modified: 0
+                    message: "Processing in progress"
+        "404":
+          description: The upload job does not exist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotFoundError"
+              example:
+                error: "Not found"
+                message: "no dataset with id 'upload_12345'"
+
+  /api/v2/datasets:
+    post:
+      summary: Bulk upload data
+      description: |-
+        Upload a zip archive for asynchronous processing.
+        The data is normalized and added to existing resources in the system.
+
+        **Important:** This endpoint returns a 202 response immediately upon accepting the upload. All validation and processing steps described below happen asynchronously in the background. To check the status of processing or see any errors that occurred, query the GET /api/v2/datasets/{id} endpoint using the returned job `id`.
+
+        #### Uploading Course Offerings
+
+        To bulk upload course offerings (combined course and section data flattened into a single record), make a multipart request with:
+        1. The `kind` field set to "course_offerings".
+        2. The `archive` field set to a zip file with:
+           - a root directory named `courses/`
+           - one or more JSON files inside `courses/` (file names are arbitrary)
+           - each JSON file has a `result` property whose value is an array of objects with the following partial schema of fields that must be present together with their expected type:
+
+             ```
+             {
+               id: string,
+               Course: string,
+               Title: string,
+               Professor: string,
+               Subject: string,
+               Section: string,
+               Year: string,
+               Avg: number,
+               Pass: number,
+               Fail: number,
+               Audit: number
+             }
+             ```
+
+        **Course Offerings Processing Steps:**
+
+        The following steps occur asynchronously after the upload is accepted. Check the GET /api/v2/datasets/{id} endpoint to monitor progress and see any errors.
+
+        1. **Validate zip format:** The uploaded file is verified to be a valid zip archive. If not, the job status is set to `failed` with message `"Data is not in a valid zip format"`.
+
+        2. **Check for courses/ directory:** The system checks for the existence of a root `courses/` directory within the archive. If missing, the job status is set to `failed` with message `"Missing root courses directory"`.
+
+        3. **Process files in courses/ directory:** For each file in the `courses/` directory:
+           - If the file is valid JSON with a `result` property, each course offering object in the `result` array is processed according to the rules below.
+           - If the file is not valid JSON or does not have a `result` property, the file is skipped.
+
+        4. **Load records into resources:** For each `result` object that is processed, the following rules apply:
+
+           **Courses:** the course `id` is set to `Subject` + `Course` (the concatenation of the field values).
+           - If the course does not exist, create a new course with:
+             - `code` set to the offering's `Course` field
+             - `title` set to the **most recent** offering's `Title` field
+             - `dept` set to the offering's `Subject` field
+
+           - If the course exists, update it only if any field value in the mapping above differs from the current resource.
+
+           **Sections:** the section `id` is set to the course offering `id`.
+           - If the section does not exist, create a new section under the course with:
+             - `instructor` set to the offering's `Professor` field
+             - `year` set to the offering's `Year` field, converted to a number (or 1900 when the offering's `Section` field equals "overall")
+             - `avg` set to the offering's `Avg` field
+             - `pass` set to the offering's `Pass` field
+             - `fail` set to the offering's `Fail` field
+             - `audit` set to the offering's `Audit` field
+
+           - If the section exists, update it only if any field value in the mapping above differs from the current resource.
+
+           **A record will not be processed if any of the following conditions are met:**
+             - A required field listed in the above schema is missing
+             - A required field's value cannot be converted to the expected type
+
+           **Note:** Courses are processed before sections to ensure every section's parent course exists before the section is created or updated.
+
+        #### Uploading Facilities
+
+        To bulk upload facilities (rooms and buildings), make a multipart request with:
+        1. The `kind` field set to "facilities".
+        2. The `archive` field set to a zip file with:
+           - an `index.htm` file at the root of the zip
+           - one or more HTML files containing building and room information linked from `index.htm`
+
+        **Facilities Processing Steps:**
+
+        The following steps occur asynchronously after the upload is accepted. Check the GET /api/v2/datasets/{id} endpoint to monitor progress and see any errors.
+
+        1. **Validate zip format:** The uploaded file is verified to be a valid zip archive. If not, the job status is set to `failed` with message `"Data is not in a valid zip format"`.
+
+        2. **Validate index.htm:** The system checks for the existence of `index.htm` at the root of the archive. If missing, the job status is set to `failed` with message `"Missing index.htm file"`.
+           The file is then parsed to verify it is valid HTML. If it cannot be parsed, the job status is set to `failed` with message `"index.htm could not be parsed"`.
+
+        3. **Locate building table:** A table with class `views-table` is located in the parsed `index.htm`. If no such table is found, the job status is set to `failed` with message `"No building table found in index.htm"`.
+
+        4. **Extract building information:** For each row in the building table, the following information is extracted:
+           - **fullname**: Text content from the `<a>` element in the cell with class `views-field-title`
+           - **shortname**: Text content from the cell with class `views-field-field-building-code`
+           - **address**: Text content from the cell with class `views-field-field-building-address`
+           - **link**: The `href` attribute from the `<a>` element in the cell with class `views-field-title`
+           - A row is skipped if any required element with the specified CSS class is not found.
+
+        5. **Extract room information:** For each link identified in `index.htm`:
+           - The linked file is read relative to the zip root
+           - A table with class `views-table` is located in the linked file
+           - For each row in the table, the following information is extracted:
+             - **number**: Text content from the `<a>` element in the cell with class `views-field-field-room-number`
+             - **seats**: Text content from the cell with class `views-field-field-room-capacity`
+             - **furniture**: Text content from the cell with class `views-field-field-room-furniture`
+             - **type**: Text content from the cell with class `views-field-field-room-type`
+             - **href**: The `href` attribute from the `<a>` element in the cell with class `views-field-nothing`
+             - A row is skipped if any required element with the specified CSS class is not found.
+           - If the file does not exist in the zip, the file cannot be parsed, or the room table is not found in the file, no room information is extracted for that building (but the building is still valid)
+
+        6. **Extract geolocation information:** For each building extracted in step 4:
+           - A GET request is sent to the geolocation service using the URL-encoded building address extracted from `index.htm`
+           - The response provides:
+             - **lat**: The latitude value returned by the geolocation service
+             - **lon**: The longitude value returned by the geolocation service
+           - If the request fails or the response contains `error`, no geolocation information is available for that building and the building should be skipped.
+
+        7. **Load records into resources:** For each building and its rooms that were successfully processed in steps 4-6, the following rules apply:
+
+           **Buildings:** the building `id` is set to `shortname`.
+           - If the building does not exist, create a new building with:
+             - `name` set to the building's `fullname`
+             - `address` set to the building's address
+             - `lat` set to the latitude from geolocation
+             - `lon` set to the longitude from geolocation
+
+           - If the building exists, update it only if any field value in the mapping above differs from the current resource.
+
+           - The resulting building resource is validated against the same requirements as building data added through `PUT /api/v2/buildings/{building}`. If required building data is missing or invalid, no building resource is loaded.
+
+           **Rooms:** the room `id` is set to `shortname_number` (the concatenation of building shortname, underscore, and room number).
+           - If the room does not exist, create a new room under the building with:
+             - `building` set to the building's shortname
+             - `number` set to the room's number field
+             - `seats` set to the room's seats field
+             - `type` set to the room's type field
+             - `furniture` set to the room's furniture field
+             - `href` set to the room's href field
+
+           - If the room exists, update it only if any field value in the mapping above differs from the current resource.
+
+           - The resulting room resource is validated against the same requirements as room data added through `PUT /api/v2/buildings/{building}/rooms/{room}`. If required room data is missing or invalid, no room resource is loaded.
+
+
+           **Note:** Buildings are processed before rooms to ensure every room's parent building exists before the room is created or updated.
+
+
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - kind
+                - archive
+              properties:
+                kind:
+                  type: string
+                  enum: ["course_offerings", "facilities"]
+                  description: The type of data contained in the archive.
+                archive:
+                  type: string
+                  format: binary
+                  description: A zip file containing the data to upload.
+            encoding:
+              archive:
+                contentType: application/zip
+            examples:
+              courseOfferingsUpload:
+                summary: Upload course offerings
+                description: Example multipart request uploading a zip file containing course offering data.
+                value:
+                  kind: "course_offerings"
+                  archive: "[binary zip file contents]"
+              facilitiesUpload:
+                summary: Upload facilities
+                description: Example multipart request uploading a zip file containing facilities data.
+                value:
+                  kind: "facilities"
+                  archive: "[binary zip file contents]"
+      responses:
+        "202":
+          description: Upload accepted and is being processed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    description: Unique identifier for this upload job
+                  status:
+                    type: string
+                    enum: ["processing"]
+                  kind:
+                    type: string
+                    enum: ["course_offerings", "facilities"]
+                    description: The type of data in this upload
+                  message:
+                    type: string
+                    enum: ["Dataset accepted for processing"]
+              example:
+                id: "upload_12345"
+                status: "processing"
+                kind: "course_offerings"
+                message: "Dataset accepted for processing"
+        "422":
+          description: Validation failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    enum: ["Validation failed"]
+                  fields:
+                    type: object
+                    properties:
+                      kind:
+                        type: string
+                        enum: ["required but missing", "expected to be course_offerings or facilities"]
+                      archive:
+                        type: string
+                        enum:
+                          [
+                            "required but missing",
+                            "expected non-empty file"
+                          ]
+              example:
+                error: "Validation failed"
+                fields:
+                  kind: "expected to be course_offerings or facilities"
+                  archive: "expected non-empty file"
+
+  /api/v2/datasets/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Dataset upload job identifier
+    get:
+      summary: Retrieve upload statistics
+      description: |-
+        Retrieve the status and statistics of a dataset upload job. The status reflects the current processing state:
+        - `processing`: The job is currently being processed according to the steps defined in the POST endpoint.
+        - `completed`: The job finished successfully. Statistics are kind-specific and report resource creation/modification outcomes during processing.
+        - `failed`: The job encountered a fatal error during validation. Check the `message` field for details (e.g., "Data is not in a valid zip format" or "Missing root courses directory" or "Missing root rooms directory").
+
+      responses:
+        "200":
+          description: Upload job status retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    description: Unique identifier for this upload job
+                  status:
+                    type: string
+                    enum: ["processing", "completed", "failed"]
+                    description: Current status of the upload job
+                  kind:
+                    type: string
+                    enum: ["course_offerings", "facilities"]
+                    description: The type of data that was uploaded
+                  stats:
+                    description: Kind-specific statistics for the upload job. Values will be 0 until processing is `completed`.
+                    oneOf:
+                      - $ref: "#/components/schemas/CourseOfferingsUploadStats"
+                      - $ref: "#/components/schemas/FacilitiesUploadStats"
+                  message:
+                    type: string
+                    description: Human-readable status message
+              examples:
+                CompletedStatus:
+                  summary: Job completed successfully
+                  value:
+                    id: "upload_12345"
+                    status: "completed"
+                    kind: "course_offerings"
+                    stats:
+                      files_total: 12
+                      files_processed: 10
+                      files_skipped: 2
+                      courses_seen: 50
+                      courses_added: 47
+                      courses_modified: 3
+                      sections_seen: 1612
+                      sections_added: 1523
+                      sections_modified: 89
+                    message: "Dataset processing complete"
+                FailedStatus:
+                  summary: Job failed during validation
+                  value:
+                    id: "upload_12346"
+                    status: "failed"
+                    kind: "course_offerings"
+                    stats:
+                      files_total: 0
+                      files_processed: 0
+                      files_skipped: 0
+                      courses_seen: 0
+                      courses_added: 0
+                      courses_modified: 0
+                      sections_seen: 0
+                      sections_added: 0
+                      sections_modified: 0
+                    message: "Data is not in a valid zip format"
+                ProcessingStatus:
+                  summary: Job still processing
+                  value:
+                    id: "upload_12347"
+                    status: "processing"
+                    kind: "course_offerings"
+                    stats:
+                      files_total: 0
+                      files_processed: 0
+                      files_skipped: 0
+                      courses_seen: 0
+                      courses_added: 0
+                      courses_modified: 0
+                      sections_seen: 0
+                      sections_added: 0
+                      sections_modified: 0
+                    message: "Processing in progress"
+                CompletedFacilitiesStatus:
+                  summary: Facilities job completed successfully
+                  value:
+                    id: "upload_12348"
+                    status: "completed"
+                    kind: "facilities"
+                    stats:
+                      buildings_added: 48
+                      buildings_modified: 4
+                      rooms_added: 352
+                      rooms_modified: 12
+                    message: "Dataset processing complete"
+        "404":
+          description: The upload job does not exist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotFoundError"
+              example:
+                error: "Not found"
+                message: "no dataset with id 'upload_12345'"
+
+  /api/v1/search:
+    post:
+      deprecated: true
+      summary: Search resources
+      description: |-
+        Deprecated. Use /api/v2/search.
+
+        Execute a query using a JSON-based domain-specific language (DSL) to search resources.
+
+        The query object has three main components:
+        - `WHERE` filters which records should be included in the results.
+        - `COLUMNS` selects which keys are included in each result.
+        - `ORDER` sorts the results by a key in `COLUMNS`.
+
+        #### Query Grammar
+
+        The DSL grammar is defined using [EBNF](https://en.wikipedia.org/wiki/Extended_Backus–Naur_form):
+
+        ```ebnf
+        QUERY ::='{' BODY ', ' OPTIONS '}'
+
+        // Note: a BODY with no FILTER (i.e. WHERE:{}) matches all entries.
+        BODY ::= 'WHERE:{' FILTER? '}'
+
+        FILTER ::= LOGICCOMPARISON | MCOMPARISON | SCOMPARISON | NEGATION
+
+        LOGICCOMPARISON ::= LOGIC ':[' FILTER_LIST ']'
+        MCOMPARISON ::= MCOMPARATOR ':{' mkey ':' number '}'
+        SCOMPARISON ::= 'IS:{' skey ': "' [*]? inputstring [*]? '" }'  // Asterisks at the beginning or end of the inputstring should act as wildcards.
+        NEGATION ::= 'NOT :{' FILTER '}'
+
+        FILTER_LIST ::= '{' FILTER '}' | '{' FILTER '}, ' FILTER_LIST // comma separated list of filters containing at least one filter
+        LOGIC ::= 'AND' | 'OR'
+        MCOMPARATOR ::= 'LT' | 'GT' | 'EQ'
+
+        OPTIONS ::= 'OPTIONS:{' COLUMNS '}' | 'OPTIONS:{' COLUMNS ', ORDER:' key '}'
+
+        COLUMNS ::= 'COLUMNS:[' KEY_LIST ']'
+
+        KEY_LIST ::= key | key ', ' KEY_LIST // comma separated list of keys containing at least one key
+
+        key ::= mkey | skey
+        mkey ::= '"' mfield '"'
+        skey ::= '"' sfield '"'
+        mfield ::= 'avg' | 'pass' | 'fail' | 'audit' | 'year'
+        sfield ::=  'title' | 'dept' | 'code' | 'instructor'
+        inputstring ::= [^*]* // Zero or more of any character, except asterisk.
+        ```
+
+        #### Wildcards
+
+        You can use optional asterisks (`*`) in `IS` comparisons to match patterns.
+        For example, `"IS": {"dept": "C*"}` matches any department that starts with "C".
+        Because the asterisks can appear at the beginning and/or end, there are four possible forms:
+        ```
+        inputstring: Matches inputstring exactly
+        *inputstring: Ends with inputstring
+        inputstring*: Starts with inputstring
+        *inputstring*: Contains inputstring
+        ```
+        Asterisks in the middle are not allowed (for example, `input*string`).
+
+        #### Order
+
+        You can sort results by specifying the ORDER field with any key that appears in your COLUMNS list.
+
+        If ORDER is not specified, results may appear in any order.
+
+        **Ties**.
+        When sorting produces tied values, the relative order of those entries is not guaranteed.
+        For example, if you sort by department, all CPSC entries will be grouped together, but individual CPSC entries may appear in any order within that group.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SearchRequest"
+            examples:
+              searchEasyCourses:
+                summary: Basic query
+                description: This query produces course offerings that have an average greater than 99.
+                value:
+                  kind: course_offerings
+                  query:
+                    {
+                      WHERE:{
+                        GT:{
+                            "avg":99
+                        }
+                      },
+                      "OPTIONS":{
+                        "COLUMNS":[
+                            "dept",
+                            "avg"
+                        ],
+                        "ORDER":"avg"
+                      }
+                  }
+
+              searchFullQuery:
+                summary: Complex query
+                description: A query that uses most components of the query DSL.
+                value:
+                  kind: course_offerings
+                  query: {
+                    "WHERE":{
+                      "OR":[
+                          {
+                            "AND":[
+                                {
+                                  "GT":{
+                                      "avg":90
+                                  }
+                                },
+                                {
+                                  "IS":{
+                                      "dept":"adhe"
+                                  }
+                                }
+                            ]
+                          },
+                          {
+                            "EQ":{
+                                "avg":95
+                            }
+                          }
+                      ]
+                    },
+                    "OPTIONS":{
+                      "COLUMNS":[
+                          "dept",
+                          "avg"
+                      ],
+                      "ORDER":"avg"
+                    }
+                  }
+      responses:
+        "200":
+          description: Results matching the search query retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  description: Result records with keys matching the `COLUMNS` list from the query.
+              examples:
+                Results---Easy courses:
+                  summary: Basic search results
+                  description: Example search results for the simple query on the PAIR dataset that selects sections with an average greater than 99.
+                  value: [
+                    { "dept": "cnps", "avg": 99.19 },
+                    { "dept": "math", "avg": 99.78 },
+                    { "dept": "math", "avg": 99.78 }
+                  ]
+                Results---Full query:
+                  summary: Complex search results
+                  description: Example search results for the complex query on the PAIR dataset.
+                  value: [
+                    { "dept": "adhe", "avg": 90.02 },
+                    { "dept": "adhe", "avg": 90.16 },
+                    { "dept": "adhe", "avg": 90.17 },
+                    { "dept": "adhe", "avg": 90.18 },
+                    { "dept": "adhe", "avg": 90.5 },
+                    { "dept": "adhe", "avg": 90.72 },
+                    { "dept": "adhe", "avg": 90.82 },
+                    { "dept": "adhe", "avg": 90.85 },
+                    { "dept": "adhe", "avg": 91.29 },
+                    { "dept": "adhe", "avg": 91.33 },
+                    { "dept": "adhe", "avg": 91.33 },
+                    { "dept": "adhe", "avg": 91.48 },
+                    { "dept": "adhe", "avg": 92.54 },
+                    { "dept": "adhe", "avg": 93.33 },
+                    { "dept": "sowk", "avg": 95 },
+                    { "dept": "rhsc", "avg": 95 },
+                    { "dept": "psyc", "avg": 95 },
+                    { "dept": "psyc", "avg": 95 },
+                    { "dept": "obst", "avg": 95 },
+                    { "dept": "nurs", "avg": 95 },
+                    { "dept": "nurs", "avg": 95 },
+                    { "dept": "musc", "avg": 95 },
+                    { "dept": "musc", "avg": 95 },
+                    { "dept": "musc", "avg": 95 },
+                    { "dept": "musc", "avg": 95 },
+                    { "dept": "musc", "avg": 95 },
+                    { "dept": "musc", "avg": 95 },
+                    { "dept": "mtrl", "avg": 95 },
+                    { "dept": "mtrl", "avg": 95 },
+                    { "dept": "mtrl", "avg": 95 },
+                    { "dept": "math", "avg": 95 },
+                    { "dept": "math", "avg": 95 },
+                    { "dept": "kin", "avg": 95 },
+                    { "dept": "kin", "avg": 95 },
+                    { "dept": "kin", "avg": 95 },
+                    { "dept": "epse", "avg": 95 },
+                    { "dept": "epse", "avg": 95 },
+                    { "dept": "epse", "avg": 95 },
+                    { "dept": "edcp", "avg": 95 },
+                    { "dept": "edcp", "avg": 95 },
+                    { "dept": "econ", "avg": 95 },
+                    { "dept": "econ", "avg": 95 },
+                    { "dept": "crwr", "avg": 95 },
+                    { "dept": "crwr", "avg": 95 },
+                    { "dept": "crwr", "avg": 95 },
+                    { "dept": "crwr", "avg": 95 },
+                    { "dept": "crwr", "avg": 95 },
+                    { "dept": "crwr", "avg": 95 },
+                    { "dept": "crwr", "avg": 95 },
+                    { "dept": "cpsc", "avg": 95 },
+                    { "dept": "cpsc", "avg": 95 },
+                    { "dept": "cnps", "avg": 95 },
+                    { "dept": "cnps", "avg": 95 },
+                    { "dept": "bmeg", "avg": 95 },
+                    { "dept": "bmeg", "avg": 95 },
+                    { "dept": "adhe", "avg": 96.11 }
+                  ]
+        "400":
+          description: Query does not conform to EBNF grammar
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    enum: ["Invalid query"]
+                  message:
+                    type: string
+                    enum:
+                      [
+                        "Missing WHERE",
+                        "Missing OPTIONS",
+                        "Missing COLUMNS",
+                        "Unknown key in COLUMNS",
+                        "ORDER must be a key in COLUMNS",
+                        "WHERE must be an object with at most one FILTER",
+                        "OPTIONS must be an object with COLUMNS and optional ORDER",
+                        "AND must be a non-empty array of FILTER objects",
+                        "OR must be a non-empty array of FILTER objects",
+                        "NOT must be a FILTER object",
+                        "LT must be an object with one mfield of type number",
+                        "GT must be an object with one mfield of type number",
+                        "EQ must be an object with one mfield of type number",
+                        "IS must be an object with one sfield of type string",
+                        "IS asterisks can only be first or last character",
+                      ]
+              examples:
+                InvalidQueryMissingWhere:
+                  summary: Missing WHERE clause
+                  value:
+                    error: "Invalid query"
+                    message: "Missing WHERE"
+                InvalidQueryInvalidColumnsKey:
+                  summary: Invalid key in COLUMNS
+                  value:
+                    error: "Invalid query"
+                    message: "Unknown key in COLUMNS"
+                InvalidQueryOrderNotInColumns:
+                  summary: ORDER not in COLUMNS
+                  value:
+                    error: "Invalid query"
+                    message: "ORDER must be a key in COLUMNS"
+        "413":
+          description: Too many results
+          $ref: "#/components/responses/ResultTooLargeResponse"
+        "422":
+          description: Validation error in request body
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    enum: ["Validation failed"]
+                  fields:
+                    type: object
+                    properties:
+                      kind:
+                        type: string
+                        enum:
+                          [
+                            "required but missing",
+                            "expected to be course_offerings"
+                          ]
+                      query:
+                        type: string
+                        enum:
+                          [
+                            "required but missing",
+                            "expected an object"
+                          ]
+              examples:
+                MissingKind:
+                  summary: Missing kind field
+                  value:
+                    error: "Validation failed"
+                    fields:
+                      kind: "required but missing"
+                InvalidKind:
+                  summary: Invalid kind value
+                  value:
+                    error: "Validation failed"
+                    fields:
+                      kind: "expected to be course_offerings"
+                MissingQuery:
+                  summary: Missing query field
+                  value:
+                    error: "Validation failed"
+                    fields:
+                      query: "required but missing"
+                InvalidQueryType:
+                  summary: Query is not an object
+                  value:
+                    error: "Validation failed"
+                    fields:
+                      query: "expected an object"
+
+  /api/v2/search:
+    post:
+      summary: Search resources
+      description: |-
+        Execute a query using a JSON-based domain-specific language (DSL) to search resources.
+
+        The query object has three main components:
+        - `WHERE` filters which records should be included in the results.
+        - `COLUMNS` selects which keys are included in each result.
+        - `ORDER` sorts the results by a key in `COLUMNS`.
+
+        **Important:** All fields used in a query must belong to the same `kind`. You cannot mix course_offerings fields with facilities fields in a single query.
+
+        #### Query Grammar
+
+        The DSL grammar is defined using [EBNF](https://en.wikipedia.org/wiki/Extended_Backus–Naur_form):
+
+        ```ebnf
+        QUERY ::='{' BODY ', ' OPTIONS '}' | '{' BODY ', ' OPTIONS ', ' TRANSFORMATIONS '}'
+
+        // Note: a BODY with no FILTER (i.e. WHERE:{}) matches all entries.
+        BODY ::= 'WHERE:{' FILTER? '}'
+
+        FILTER ::= LOGICCOMPARISON | MCOMPARISON | SCOMPARISON | NEGATION
+
+        LOGICCOMPARISON ::= LOGIC ':[' FILTER_LIST ']'
+        MCOMPARISON ::= MCOMPARATOR ':{' mkey ':' number '}'
+        SCOMPARISON ::= 'IS:{' skey ': "' [*]? inputstring [*]? '" }'  // Asterisks at the beginning or end of the inputstring should act as wildcards.
+        NEGATION ::= 'NOT :{' FILTER '}'
+
+        FILTER_LIST ::= '{' FILTER '}' | '{' FILTER '}, ' FILTER_LIST // comma separated list of filters containing at least one filter
+        LOGIC ::= 'AND' | 'OR'
+        MCOMPARATOR ::= 'LT' | 'GT' | 'EQ'
+
+        OPTIONS ::= 'OPTIONS:{' COLUMNS '}' | 'OPTIONS:{' COLUMNS ', ' SORT '}'
+
+        SORT ::= 'ORDER: { dir:'  DIRECTION ', keys: [ ' ANYKEY_LIST '] }' | 'ORDER: ' ANYKEY
+        DIRECTION ::= 'UP' | 'DOWN'
+
+        TRANSFORMATIONS ::= 'TRANSFORMATIONS: {' GROUP ', ' APPLY '}'
+        GROUP ::= 'GROUP: [' KEY_LIST ']'
+        APPLY ::= 'APPLY: [' APPLYRULE_LIST? ']'
+        APPLYRULE_LIST ::=  APPLYRULE | APPLYRULE ', ' APPLYRULE_LIST
+        APPLYRULE ::= '{' applykey ': {' APPLYTOKEN ':' KEY '} }'
+        APPLYTOKEN ::= 'MAX' | 'MIN' | 'AVG' | 'COUNT' | 'SUM'
+
+        COLUMNS ::= 'COLUMNS:[' ANYKEY_LIST ']'
+
+        // Comma-separated list of keys containing at least one key
+        KEY_LIST ::= KEY | KEY ', ' KEY_LIST
+        ANYKEY_LIST ::= ANYKEY | ANYKEY ', ' ANYKEY_LIST
+
+        ANYKEY ::= KEY | applykey
+        KEY ::= mkey | skey
+
+        mkey ::= '"' mfield '"'
+        skey ::= '"' sfield '"'
+        inputstring ::= [^*]* // Zero or more of any character, except asterisk.
+        applykey ::= [^_]+ // One or more of any character, except underscore.
+        ```
+
+        #### Course Offerings Fields
+
+        When querying `course_offerings` kind, use these fields:
+
+        ```ebnf
+        mfield ::= 'avg' | 'pass' | 'fail' | 'audit' | 'year'
+        sfield ::= 'title' | 'dept' | 'code' | 'instructor'
+        ```
+
+        #### Facilities Fields
+
+        When querying `facilities` kind, use these fields:
+
+        ```ebnf
+        mfield ::= 'lat' | 'lon' | 'seats'
+        sfield ::= 'address' | 'building' | 'furniture' | 'href' | 'name' | 'number' | 'type'
+        ```
+
+        #### Aggregation
+
+        The query language supports performing calculations across a group of results.
+
+        **Supported Aggregation Functions:**
+
+        - **MAX**: Find the maximum value of an mfield. Returns the same number that is in the originating dataset.
+        - **MIN**: Find the minimum value of an mfield. Returns the same number that is in the originating dataset.
+        - **AVG**: Find the average value of an mfield. Returns a number rounded to two decimal places.
+        - **SUM**: Find the sum of an mfield. Returns a number rounded to two decimal places.
+        - **COUNT**: Count the number of unique occurrences of a field. Returns whole numbers.
+
+        **Requirements:**
+
+        - MAX/MIN/AVG/SUM should only be requested for numeric keys (mfield). COUNT can be requested for all keys.
+        - The applykey in an APPLYRULE should be unique, so no two APPLYRULEs should share an applykey with the same name.
+        - If GROUP is present, all COLUMNS keys must correspond to one of the GROUP keys or to applykeys defined in the APPLY block.
+
+        #### Sort
+
+        The query language supports sorting by:
+
+        - **A single column** as in V1, e.g., `"ORDER": "avg"`
+        - **Multiple columns with direction** by creating an object to sort by ascending or descending order and by multiple columns, e.g., `"ORDER": {"dir": "DOWN", "keys": ["maxSeats"]}`
+
+        **Direction (`dir`)**: The order of the sorting is set by the direction:
+        - `"UP"`: Sort results ascending
+        - `"DOWN"`: Sort results descending
+
+        **Keys**: The `keys` field allows for sorting by multiple keys (i.e., columns), where each additional key resolves ties for the previous key.
+
+        Examples:
+        - `"keys": ["avg"]`: sorts by a single key
+        - `"keys": ["year", "avg"]`: sorts by multiple keys. In this case, the average should be used to resolve ties for entries in the same year
+
+        **Requirements:**
+        - All SORT keys must also be in the COLUMNS.
+        - When sorting produces tied values (and no additional keys are specified to break ties), the relative order of those entries is not guaranteed.
+
+        #### Wildcards
+
+        You can use optional asterisks (`*`) in `IS` comparisons to match patterns.
+        For example, `"IS": {"dept": "C*"}` matches any department that starts with "C".
+        Because the asterisks can appear at the beginning and/or end, there are four possible forms:
+        ```
+        inputstring: Matches inputstring exactly
+        *inputstring: Ends with inputstring
+        inputstring*: Starts with inputstring
+        *inputstring*: Contains inputstring
+        ```
+        Asterisks in the middle are not allowed (for example, `input*string`).
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SearchRequest"
+            examples:
+              searchEasyCourses:
+                summary: Basic course query
+                description: This query produces course offerings that have an average greater than 99.
+                value:
+                  kind: course_offerings
+                  query:
+                    WHERE:
+                      GT:
+                        avg: 99
+                    OPTIONS:
+                      COLUMNS:
+                        - dept
+                        - avg
+
+              searchLargeRooms:
+                summary: Basic facilities query
+                description: This query produces rooms with more than 100 seats.
+                value:
+                  kind: facilities
+                  query:
+                    WHERE:
+                      GT:
+                        seats: 350
+                    OPTIONS:
+                      COLUMNS:
+                        - building
+                        - number
+                        - seats
+                      ORDER:
+                        - seats
+
+              searchFullQuery:
+                summary: Complex facilities query
+                description: A query that uses the new components of the full query DSL.
+                value:
+                  kind: facilities
+                  query:
+                    WHERE:
+                      IS:
+                        building: "A*"
+                    OPTIONS:
+                      COLUMNS:
+                        - building
+                        - minSeats
+                      ORDER:
+                        dir: "DOWN"
+                        keys: ["minSeats", "building"]
+                    TRANSFORMATIONS:
+                      GROUP: ["building"]
+                      APPLY: [{ "minSeats": { MIN: "seats" } }]
+
+      responses:
+        "200":
+          description: Results matching the search query retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  description: Result records with keys matching the `COLUMNS` list from the query.
+              examples:
+                Results---Easy courses:
+                  summary: Basic search results
+                  description: Example search results for the simple query on the PAIR dataset that selects sections with an average greater than 99.
+                  value: [
+                    { "dept": "cnps", "avg": 99.19 },
+                    { "dept": "math", "avg": 99.78 },
+                    { "dept": "math", "avg": 99.78 }
+                  ]
+                Results---Large rooms:
+                  summary: Facilities search results
+                  description: Example search results for rooms with more than 350 seats from campus.zip.
+                  value: [
+                    { "building": "HEBB", "number": "100", "seats": 375 },
+                    { "building": "CIRS", "number": "1250", "seats": 426 },
+                    { "building": "OSBO", "number": "A", "seats": 442 },
+                    { "building": "WOOD", "number": "2", "seats": 503 }
+                  ]
+                Results---Full query:
+                  summary: Complex search results
+                  description: Example search results for the complex query on the campus.zip dataset.
+                  value: [
+                    { "building": "AERL", "minSeats": 144 },
+                    { "building": "ANSO", "minSeats": 26 },
+                    { "building": "AUDX", "minSeats": 20 },
+                    { "building": "ALRD", "minSeats": 20 },
+                    { "building": "ANGU", "minSeats": 16 }
+                  ]
+        "400":
+          description: Query does not conform to EBNF grammar
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    enum: ["Invalid query"]
+                  message:
+                    type: string
+                    enum:
+                      [
+                        "Missing WHERE",
+                        "Missing OPTIONS",
+                        "Missing COLUMNS",
+                        "Unknown key in COLUMNS",
+                        "ORDER must be a key in COLUMNS",
+                        "All ORDER keys must be in COLUMNS",
+                        "Invalid sort direction (must be UP or DOWN)",
+                        "WHERE must be an object with at most one FILTER",
+                        "OPTIONS must be an object with COLUMNS and optional ORDER",
+                        "AND must be a non-empty array of FILTER objects",
+                        "OR must be a non-empty array of FILTER objects",
+                        "NOT must be a FILTER object",
+                        "LT must be an object with one mfield of type number",
+                        "GT must be an object with one mfield of type number",
+                        "EQ must be an object with one mfield of type number",
+                        "IS must be an object with one sfield of type string",
+                        "IS asterisks can only be first or last character",
+                        "Cannot mix course_offerings and facilities fields in one query",
+                        "Missing GROUP in TRANSFORMATIONS",
+                        "Missing APPLY in TRANSFORMATIONS",
+                        "GROUP must be a non-empty array",
+                        "APPLY must be an array",
+                        "When TRANSFORMATIONS is present, all COLUMNS must be in GROUP or APPLY",
+                        "Invalid APPLYTOKEN (must be MAX, MIN, AVG, COUNT, or SUM)",
+                        "MAX/MIN/AVG/SUM can only be applied to mfields",
+                        "APPLYRULE must apply aggregation to a valid KEY",
+                        "Duplicate applykey in APPLY",
+                        "applykey cannot be empty or contain underscore",
+                      ]
+              examples:
+                InvalidQueryMissingWhere:
+                  summary: Missing WHERE clause
+                  value:
+                    error: "Invalid query"
+                    message: "Missing WHERE"
+                InvalidQueryInvalidColumnsKey:
+                  summary: Invalid key in COLUMNS
+                  value:
+                    error: "Invalid query"
+                    message: "Unknown key in COLUMNS"
+                InvalidQueryOrderNotInColumns:
+                  summary: ORDER not in COLUMNS
+                  value:
+                    error: "Invalid query"
+                    message: "ORDER must be a key in COLUMNS"
+                InvalidQueryMixedKinds:
+                  summary: Mixed field kinds
+                  value:
+                    error: "Invalid query"
+                    message: "Cannot mix course_offerings and facilities fields in one query"
+                InvalidAggregationOnStringKey:
+                  summary: Aggregation on non-numeric key
+                  value:
+                    error: "Invalid query"
+                    message: "MAX/MIN/AVG/SUM can only be applied to mfields"
+                DuplicateApplyKey:
+                  summary: Duplicate applykey in APPLY
+                  value:
+                    error: "Invalid query"
+                    message: "Duplicate applykey in APPLY"
+                ColumnsNotInGroup:
+                  summary: COLUMNS key not in GROUP or APPLY
+                  value:
+                    error: "Invalid query"
+                    message: "When TRANSFORMATIONS is present, all COLUMNS must be in GROUP or APPLY"
+                InvalidApplyToken:
+                  summary: Invalid aggregation function
+                  value:
+                    error: "Invalid query"
+                    message: "Invalid APPLYTOKEN (must be MAX, MIN, AVG, COUNT, or SUM)"
+                InvalidSortDirection:
+                  summary: Invalid sort direction
+                  value:
+                    error: "Invalid query"
+                    message: "Invalid sort direction (must be UP or DOWN)"
+                SortKeyNotInColumns:
+                  summary: SORT key not in COLUMNS
+                  value:
+                    error: "Invalid query"
+                    message: "All ORDER keys must be in COLUMNS"
+                MissingTransformationsGroup:
+                  summary: TRANSFORMATIONS without GROUP
+                  value:
+                    error: "Invalid query"
+                    message: "Missing GROUP in TRANSFORMATIONS"
+                MissingTransformationsApply:
+                  summary: TRANSFORMATIONS without APPLY
+                  value:
+                    error: "Invalid query"
+                    message: "Missing APPLY in TRANSFORMATIONS"
+                EmptyGroupArray:
+                  summary: GROUP is empty
+                  value:
+                    error: "Invalid query"
+                    message: "GROUP must be a non-empty array"
+                ApplykeyWithUnderscore:
+                  summary: applykey is empty or contains underscore
+                  value:
+                    error: "Invalid query"
+                    message: "applykey cannot be empty or contain underscore"
+        "413":
+          description: Too many results
+          $ref: "#/components/responses/ResultTooLargeResponse"
+        "422":
+          description: Validation error in request body
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    enum: ["Validation failed"]
+                  fields:
+                    type: object
+                    properties:
+                      kind:
+                        type: string
+                        enum:
+                          [
+                            "required but missing",
+                            "expected to be course_offerings or facilities"
+                          ]
+                      query:
+                        type: string
+                        enum:
+                          [
+                            "required but missing",
+                            "expected an object"
+                          ]
+              examples:
+                MissingKind:
+                  summary: Missing kind field
+                  value:
+                    error: "Validation failed"
+                    fields:
+                      kind: "required but missing"
+                InvalidKind:
+                  summary: Invalid kind value
+                  value:
+                    error: "Validation failed"
+                    fields:
+                      kind: "expected to be course_offerings or facilities"
+                MissingQuery:
+                  summary: Missing query field
+                  value:
+                    error: "Validation failed"
+                    fields:
+                      query: "required but missing"
+                InvalidQueryType:
+                  summary: Query is not an object
+                  value:
+                    error: "Validation failed"
+                    fields:
+                      query: "expected an object"
+
+  /api/v1/courses:
+    get:
+      summary: Retrieve a list of courses
+      description: Results are ordered by `id` ascending to ensure stable pagination.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 5000
+            default: 100
+          description: Maximum number of courses to return
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+          description: Number of courses to skip
+      responses:
+        "200":
+          description: Courses retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Course"
+                  total:
+                    type: integer
+                    description: Overall total number of courses (ignores limit/offset)
+                  limit:
+                    type: integer
+                    description: Maximum number returned in this request
+                  offset:
+                    type: integer
+                    description: Number of courses skipped
+              example:
+                total: 2
+                limit: 100
+                offset: 0
+                items:
+                  - id: cpsc210
+                    title: Software Construction
+                    dept: Computer Science
+                    code: "210"
+                    links:
+                      self: "/api/v1/courses/cpsc210"
+                      sections: "/api/v1/courses/cpsc210/sections"
+                  - id: cpsc310
+                    title: Introduction to Software Engineering
+                    dept: Computer Science
+                    code: "310"
+                    links:
+                      self: "/api/v1/courses/cpsc310"
+                      sections: "/api/v1/courses/cpsc310/sections"
+        "400":
+          description: Invalid request parameters
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    enum: ["Invalid request parameters"]
+                  params:
+                    type: object
+                    properties:
+                      limit:
+                        type: string
+                        enum: ["expected an integer between 1 and 5000"]
+                      offset:
+                        type: string
+                        enum: ["expected an integer >= 0"]
+              example:
+                error: "Invalid request parameters"
+                params:
+                  limit: "expected an integer between 1 and 5000"
+                  offset: "expected an integer >= 0"
+
+  /api/v1/courses/{course}:
+    parameters:
+      - $ref: "#/components/parameters/CourseParam"
+    get:
+      summary: Retrieve a course
+      responses:
+        "200":
+          description: Course retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Course"
+              example:
+                id: cpsc310
+                title: Introduction to Software Engineering
+                dept: Computer Science
+                code: "310"
+                links:
+                  self: "/api/v1/courses/cpsc310"
+                  sections: "/api/v1/courses/cpsc310/sections"
+        "404":
+          description: The course does not exist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotFoundError"
+              example:
+                error: "Not found"
+                message: "no course with id 'cpsc310'"
+    put:
+      summary: Create or replace a course
+      description: If the course already exists, the entire course is replaced; otherwise it is created.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/Course"
+                - type: object
+                  required:
+                    - title
+                    - dept
+                    - code
+            example:
+              title: Introduction to Software Engineering
+              dept: Computer Science
+              code: "310"
+      responses:
+        "201":
+          description: Course created successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Course"
+              example:
+                id: cpsc310
+                title: Introduction to Software Engineering
+                dept: Computer Science
+                code: "310"
+                links:
+                  self: "/api/v1/courses/cpsc310"
+                  sections: "/api/v1/courses/cpsc310/sections"
+        "204":
+          description: Course updated successfully
+        "422":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    enum: ["Validation failed"]
+                  fields:
+                    type: object
+                    properties:
+                      title:
+                        type: string
+                        enum: ["required but missing", "expected a string"]
+                      dept:
+                        type: string
+                        enum: ["required but missing", "expected a string"]
+                      code:
+                        type: string
+                        enum: ["required but missing", "expected a string"]
+              example:
+                error: "Validation failed"
+                fields:
+                  dept: "required but missing"
+                  code: "expected a string"
+    delete:
+      summary: Remove a course
+      description: The course and all of its sections are permanently removed. The response includes the course metadata and a count of sections that were removed.
+      responses:
+        "200":
+          description: Course removed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  title:
+                    description: The title of the course.
+                    type: string
+                  dept:
+                    description: The department that offers the course.
+                    type: string
+                  code:
+                    description: The course code identifier.
+                    type: string
+                  sections:
+                    description: The number of sections that were removed with the course.
+                    type: integer
+                    minimum: 0
+              example:
+                id: cpsc310
+                title: Introduction to Software Engineering
+                dept: Computer Science
+                code: "310"
+                sections: 2
+        "404":
+          description: The course does not exist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotFoundError"
+              example:
+                error: "Not found"
+                message: "no course with id 'cpsc310'"
+
+  /api/v1/courses/{course}/sections:
+    parameters:
+      - $ref: "#/components/parameters/CourseParam"
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 5000
+          default: 100
+        description: Maximum number of sections to return
+      - name: offset
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+          default: 0
+        description: Number of sections to skip
+    get:
+      summary: Retrieve a list of sections for a course
+      description: Results are ordered by `id` ascending to ensure stable pagination.
+      responses:
+        "200":
+          description: Sections retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Section"
+                  total:
+                    type: integer
+                    description: Overall total number of sections (ignores limit/offset)
+                  limit:
+                    type: integer
+                    description: Maximum number returned in this request
+                  offset:
+                    type: integer
+                    description: Number of sections skipped
+              example:
+                total: 2
+                limit: 100
+                offset: 0
+                items:
+                  - id: 21w201
+                    instructor: holmes, reid
+                    year: 2021
+                    avg: 76.40
+                    pass: 167
+                    fail: 3
+                    audit: 1
+                    links:
+                      self: "/api/v1/courses/cpsc310/sections/21w201"
+                      course: "/api/v1/courses/cpsc310"
+                  - id: 21w202
+                    instructor: bradley, nick
+                    year: 2021
+                    avg: 77.10
+                    pass: 172
+                    fail: 1
+                    audit: 0
+                    links:
+                      self: "/api/v1/courses/cpsc310/sections/21w202"
+                      course: "/api/v1/courses/cpsc310"
+        "404":
+          description: The course does not exist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotFoundError"
+              example:
+                error: "Not found"
+                message: "no course with id 'cpsc310'"
+        "400":
+          description: Invalid request parameters
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    enum: ["Invalid request parameters"]
+                  params:
+                    type: object
+                    properties:
+                      limit:
+                        type: string
+                        enum: ["expected an integer between 1 and 5000"]
+                      offset:
+                        type: string
+                        enum: ["expected an integer >= 0"]
+              example:
+                error: "Invalid request parameters"
+                params:
+                  limit: "expected an integer between 1 and 5000"
+                  offset: "expected an integer >= 0"
+
+  /api/v1/courses/{course}/sections/{section}:
+    parameters:
+      - $ref: "#/components/parameters/CourseParam"
+      - $ref: "#/components/parameters/SectionParam"
+    get:
+      summary: Retrieve a section for a course
+      responses:
+        "200":
+          description: Section retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Section"
+              example:
+                id: 21w201
+                instructor: holmes, reid
+                year: 2021
+                avg: 76.40
+                pass: 167
+                fail: 3
+                audit: 1
+                links:
+                  self: "/api/v1/courses/cpsc310/sections/21w201"
+                  course: "/api/v1/courses/cpsc310"
+        "404":
+          description: The course or section does not exist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotFoundError"
+              examples:
+                CourseNotFound:
+                  summary: Course not found
+                  value:
+                    error: "Not found"
+                    message: "no course with id 'cpsc310'"
+                SectionNotFound:
+                  summary: Section not found
+                  value:
+                    error: "Not found"
+                    message: "no section with id '21w201'"
+    put:
+      summary: Create or replace a section for a course
+      description: If the section already exists, the entire section is replaced; otherwise it is created.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/Section"
+                - type: object
+                  required:
+                    - instructor
+                    - year
+                    - avg
+                    - pass
+                    - fail
+                    - audit
+            example:
+              instructor: holmes, reid
+              year: 2021
+              avg: 76.40
+              pass: 167
+              fail: 3
+              audit: 1
+      responses:
+        "201":
+          description: Section created successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Section"
+              example:
+                id: 21w201
+                instructor: holmes, reid
+                year: 2021
+                avg: 76.40
+                pass: 167
+                fail: 3
+                audit: 1
+                links:
+                  self: "/api/v1/courses/cpsc310/sections/21w201"
+                  course: "/api/v1/courses/cpsc310"
+        "204":
+          description: Section updated successfully
+        "404":
+          description: The course does not exist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotFoundError"
+              example:
+                error: "Not found"
+                message: "no course with id 'cpsc310'"
+        "422":
+          description: Validation failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    enum: ["Validation failed"]
+                  fields:
+                    type: object
+                    properties:
+                      instructor:
+                        type: string
+                        enum: ["required but missing", "expected a string"]
+                      year:
+                        type: string
+                        enum:
+                          [
+                            "required but missing",
+                            "expected a number between 1900 and 2099",
+                          ]
+                      avg:
+                        type: string
+                        enum:
+                          [
+                            "required but missing",
+                            "expected a number between 0 and 100",
+                          ]
+                      pass:
+                        type: string
+                        enum: ["required but missing", "expected a number >= 0"]
+                      fail:
+                        type: string
+                        enum: ["required but missing", "expected a number >= 0"]
+                      audit:
+                        type: string
+                        enum: ["required but missing", "expected a number >= 0"]
+              example:
+                error: "Validation failed"
+                fields:
+                  instructor: "required but missing"
+                  year: "expected a number between 1900 and 2099"
+                  avg: "expected a number between 0 and 100"
+                  fail: "expected a number >= 0"
+    delete:
+      summary: Remove a section from a course
+      description: The section is permanently removed and its data is returned.
+      responses:
+        "200":
+          description: Section successfully removed and included in the response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  instructor:
+                    description: The instructor's full name.
+                    example: smith, john will
+                    type: string
+                  year:
+                    type: integer
+                    minimum: 1900
+                    maximum: 2099
+                    description: The year in which the section was offered.
+                  avg:
+                    type: number
+                    minimum: 0
+                    maximum: 100
+                    description: The average grade of students enroled in the section.
+                  pass:
+                    type: integer
+                    minimum: 0
+                    description: The number of students in the section who achieved a passing grade.
+                  fail:
+                    type: integer
+                    minimum: 0
+                    description: The number of students in the section who did not achieve a passing grade.
+                  audit:
+                    type: integer
+                    minimum: 0
+                    description: The number of students in the section who audited the course.
+              example:
+                id: 21w201
+                instructor: holmes, reid
+                year: 2021
+                avg: 76.40
+                pass: 167
+                fail: 3
+                audit: 1
+        "404":
+          description: The course or section does not exist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotFoundError"
+              examples:
+                CourseNotFound:
+                  summary: Course not found
+                  value:
+                    error: "Not found"
+                    message: "no course with id 'cpsc310'"
+                SectionNotFound:
+                  summary: Section not found
+                  value:
+                    error: "Not found"
+                    message: "no section with id '21w201'"
+
+  /api/v2/buildings:
+    get:
+      summary: Retrieve a list of buildings
+      description: Results are ordered by `id` ascending to ensure stable pagination.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 5000
+            default: 100
+          description: Maximum number of buildings to return
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+          description: Number of buildings to skip
+      responses:
+        "200":
+          description: Buildings retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Building"
+                  total:
+                    type: integer
+                    description: Overall total number of buildings (ignores limit/offset)
+                  limit:
+                    type: integer
+                    description: Maximum number returned in this request
+                  offset:
+                    type: integer
+                    description: Number of buildings skipped
+              example:
+                total: 2
+                limit: 100
+                offset: 0
+                items:
+                  - id: DMP
+                    name: Hugh Dempster Pavilion
+                    address: 6245 Agronomy Road V6T 1Z4
+                    lat: 49.26125
+                    lon: -123.24807
+                    links:
+                      self: "/api/v2/buildings/DMP"
+                      rooms: "/api/v2/buildings/DMP/rooms"
+                  - id: ORCH
+                    name: Orchard Commons
+                    address: 6363 Agronomy Road
+                    lat: 49.26048
+                    lon: -123.25027
+                    links:
+                      self: "/api/v2/buildings/ORCH"
+                      rooms: "/api/v2/buildings/ORCH/rooms"
+        "400":
+          description: Invalid request parameters
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    enum: ["Invalid request parameters"]
+                  params:
+                    type: object
+                    properties:
+                      limit:
+                        type: string
+                        enum: ["expected an integer between 1 and 5000"]
+                      offset:
+                        type: string
+                        enum: ["expected an integer >= 0"]
+              example:
+                error: "Invalid request parameters"
+                params:
+                  limit: "expected an integer between 1 and 5000"
+                  offset: "expected an integer >= 0"
+
+  /api/v2/buildings/{building}:
+    parameters:
+      - $ref: "#/components/parameters/BuildingParam"
+    get:
+      summary: Retrieve a building
+      responses:
+        "200":
+          description: Building retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Building"
+              example:
+                id: DMP
+                name: Hugh Dempster Pavilion
+                address: 6245 Agronomy Road V6T 1Z4
+                lat: 49.26125
+                lon: -123.24807
+                links:
+                  self: "/api/v2/buildings/DMP"
+                  rooms: "/api/v2/buildings/DMP/rooms"
+        "404":
+          description: The building does not exist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotFoundError"
+              example:
+                error: "Not found"
+                message: "no building with id 'DMP'"
+    put:
+      summary: Create or replace a building
+      description: If the building already exists, the entire building is replaced; otherwise it is created.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/Building"
+                - type: object
+                  required:
+                    - name
+                    - address
+                    - lat
+                    - lon
+            example:
+              name: Hugh Dempster Pavilion
+              address: 6245 Agronomy Road V6T 1Z4
+              lat: 49.26125
+              lon: -123.24807
+      responses:
+        "201":
+          description: Building created successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Building"
+              example:
+                id: DMP
+                name: Hugh Dempster Pavilion
+                address: 6245 Agronomy Road V6T 1Z4
+                lat: 49.26125
+                lon: -123.24807
+                links:
+                  self: "/api/v2/buildings/DMP"
+                  rooms: "/api/v2/buildings/DMP/rooms"
+        "204":
+          description: Building updated successfully
+        "422":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    enum: ["Validation failed"]
+                  fields:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                        enum: ["required but missing", "expected a string"]
+                      address:
+                        type: string
+                        enum: ["required but missing", "expected a string"]
+                      lat:
+                        type: string
+                        enum: ["required but missing", "expected a number"]
+                      lon:
+                        type: string
+                        enum: ["required but missing", "expected a number"]
+              example:
+                error: "Validation failed"
+                fields:
+                  name: "required but missing"
+                  lat: "expected a number"
+    delete:
+      summary: Remove a building
+      description: The building and all of its rooms are permanently removed. The response includes the building metadata and a count of rooms that were removed.
+      responses:
+        "200":
+          description: Building removed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  name:
+                    description: The full name of the building.
+                    type: string
+                  address:
+                    description: The building address.
+                    type: string
+                  lat:
+                    description: The latitude of the building.
+                    type: number
+                  lon:
+                    description: The longitude of the building.
+                    type: number
+                  rooms:
+                    description: The number of rooms that were removed with the building.
+                    type: integer
+                    minimum: 0
+              example:
+                id: DMP
+                name: Hugh Dempster Pavilion
+                address: 6245 Agronomy Road V6T 1Z4
+                lat: 49.26125
+                lon: -123.24807
+                rooms: 82
+        "404":
+          description: The building does not exist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotFoundError"
+              example:
+                error: "Not found"
+                message: "no building with id 'DMP'"
+
+  /api/v2/buildings/{building}/rooms:
+    parameters:
+      - $ref: "#/components/parameters/BuildingParam"
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 5000
+          default: 100
+        description: Maximum number of rooms to return
+      - name: offset
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+          default: 0
+        description: Number of rooms to skip
+    get:
+      summary: Retrieve a list of rooms for a building
+      description: Results are ordered by `id` ascending to ensure stable pagination.
+      responses:
+        "200":
+          description: Rooms retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Room"
+                  total:
+                    type: integer
+                    description: Overall total number of rooms (ignores limit/offset)
+                  limit:
+                    type: integer
+                    description: Maximum number returned in this request
+                  offset:
+                    type: integer
+                    description: Number of rooms skipped
+              example:
+                total: 2
+                limit: 100
+                offset: 0
+                items:
+                  - id: DMP_101
+                    building: DMP
+                    number: "101"
+                    type: Open Design General Purpose
+                    furniture: Classroom-Movable Tables & Chairs
+                    href: http://students.ubc.ca/campus/discover/buildings-and-classrooms/room/DMP-101
+                    seats: 40
+                    links:
+                      self: "/api/v2/buildings/DMP/rooms/DMP_101"
+                      building: "/api/v2/buildings/DMP"
+                  - id: DMP_201
+                    building: DMP
+                    number: "201"
+                    type: Small Group
+                    furniture: Classroom-Movable Tables & Chairs
+                    href: http://students.ubc.ca/campus/discover/buildings-and-classrooms/room/DMP-201
+                    seats: 25
+                    links:
+                      self: "/api/v2/buildings/DMP/rooms/DMP_201"
+                      building: "/api/v2/buildings/DMP"
+        "404":
+          description: The building does not exist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotFoundError"
+              example:
+                error: "Not found"
+                message: "no building with id 'DMP'"
+        "400":
+          description: Invalid request parameters
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    enum: ["Invalid request parameters"]
+                  params:
+                    type: object
+                    properties:
+                      limit:
+                        type: string
+                        enum: ["expected an integer between 1 and 5000"]
+                      offset:
+                        type: string
+                        enum: ["expected an integer >= 0"]
+              example:
+                error: "Invalid request parameters"
+                params:
+                  limit: "expected an integer between 1 and 5000"
+                  offset: "expected an integer >= 0"
+
+  /api/v2/buildings/{building}/rooms/{room}:
+    parameters:
+      - $ref: "#/components/parameters/BuildingParam"
+      - $ref: "#/components/parameters/RoomParam"
+    get:
+      summary: Retrieve a room for a building
+      responses:
+        "200":
+          description: Room retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Room"
+              example:
+                id: DMP_101
+                building: DMP
+                number: "101"
+                type: Open Design General Purpose
+                furniture: Classroom-Movable Tables & Chairs
+                href: http://students.ubc.ca/campus/discover/buildings-and-classrooms/room/DMP-101
+                seats: 40
+                links:
+                  self: "/api/v2/buildings/DMP/rooms/DMP_101"
+                  building: "/api/v2/buildings/DMP"
+        "404":
+          description: The building or room does not exist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotFoundError"
+              examples:
+                BuildingNotFound:
+                  summary: Building not found
+                  value:
+                    error: "Not found"
+                    message: "no building with id 'DMP'"
+                RoomNotFound:
+                  summary: Room not found
+                  value:
+                    error: "Not found"
+                    message: "no room with id 'DMP_101'"
+    put:
+      summary: Create or replace a room for a building
+      description: If the room already exists, the entire room is replaced; otherwise it is created.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/Room"
+                - type: object
+                  required:
+                    - building
+                    - number
+                    - type
+                    - furniture
+                    - href
+                    - seats
+            example:
+              building: DMP
+              number: "101"
+              type: Open Design General Purpose
+              furniture: Classroom-Movable Tables & Chairs
+              href: http://students.ubc.ca/campus/discover/buildings-and-classrooms/room/DMP-101
+              seats: 40
+      responses:
+        "201":
+          description: Room created successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Room"
+              example:
+                id: DMP_101
+                building: DMP
+                number: "101"
+                type: Open Design General Purpose
+                furniture: Classroom-Movable Tables & Chairs
+                href: http://students.ubc.ca/campus/discover/buildings-and-classrooms/room/DMP-101
+                seats: 40
+                links:
+                  self: "/api/v2/buildings/DMP/rooms/DMP_101"
+                  building: "/api/v2/buildings/DMP"
+        "204":
+          description: Room updated successfully
+        "404":
+          description: The building does not exist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotFoundError"
+              example:
+                error: "Not found"
+                message: "no building with id 'DMP'"
+        "422":
+          description: Validation failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    enum: ["Validation failed"]
+                  fields:
+                    type: object
+                    properties:
+                      building:
+                        type: string
+                        enum:
+                          [
+                            "required but missing",
+                            "expected a string",
+                            "must match parent building in path",
+                          ]
+                      number:
+                        type: string
+                        enum: ["required but missing", "expected a string"]
+                      type:
+                        type: string
+                        enum: ["required but missing", "expected a string"]
+                      furniture:
+                        type: string
+                        enum: ["required but missing", "expected a string"]
+                      href:
+                        type: string
+                        enum: ["required but missing", "expected a string"]
+                      seats:
+                        type: string
+                        enum: ["required but missing", "expected a number >= 0"]
+              example:
+                error: "Validation failed"
+                fields:
+                  building: "must match parent building in path"
+                  number: "expected a string"
+                  type: "required but missing"
+                  seats: "expected a number >= 0"
+    delete:
+      summary: Remove a room from a building
+      description: The room is permanently removed and its data is returned.
+      responses:
+        "200":
+          description: Room successfully removed and included in the response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  building:
+                    type: string
+                    description: The building identifier.
+                  number:
+                    type: string
+                    description: The room number.
+                  type:
+                    type: string
+                    description: The room type.
+                  furniture:
+                    type: string
+                    description: The room furniture description.
+                  href:
+                    type: string
+                    description: Link to full room details.
+                  seats:
+                    type: integer
+                    minimum: 0
+                    description: The number of seats in the room.
+              example:
+                id: DMP_101
+                building: DMP
+                number: "101"
+                type: Open Design General Purpose
+                furniture: Classroom-Movable Tables & Chairs
+                href: http://students.ubc.ca/campus/discover/buildings-and-classrooms/room/DMP-101
+                seats: 40
+        "404":
+          description: The building or room does not exist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotFoundError"
+              examples:
+                BuildingNotFound:
+                  summary: Building not found
+                  value:
+                    error: "Not found"
+                    message: "no building with id 'DMP'"
+                RoomNotFound:
+                  summary: Room not found
+                  value:
+                    error: "Not found"
+                    message: "no room with id 'DMP_101'"
+
+components:
+  schemas:
+    Course:
+      type: object
+      description: All properties are included in the response.
+      properties:
+        id:
+          type: string
+          readOnly: true
+        title:
+          type: string
+          description: The title of the course.
+        dept:
+          type: string
+          description: The department that offers the course.
+        code:
+          type: string
+          description: The course code identifier.
+        links:
+          type: object
+          readOnly: true
+          properties:
+            self:
+              type: string
+              format: uri-reference
+            sections:
+              description: URL to the sections endpoint for this course
+              type: string
+              format: uri-reference
+    SearchRequest:
+      type: object
+      required:
+        - kind
+        - query
+      properties:
+        kind:
+          type: string
+          enum: ["course_offerings", "facilities"]
+          description: The type of resource to query.
+        query:
+          type: object
+          description: A query object that follows the DSL grammar defined in the EBNF.
+    CourseOfferingsUploadStats:
+      type: object
+      description: Statistics for a `course_offerings` upload job.
+      properties:
+        files_total:
+          type: integer
+          minimum: 0
+          description: Total number of files found in the courses/ directory
+        files_processed:
+          type: integer
+          minimum: 0
+          description: Number of files successfully processed (contained valid JSON with a `result` property)
+        files_skipped:
+          type: integer
+          minimum: 0
+          description: Number of files skipped (invalid JSON or missing `result` property)
+        courses_seen:
+          type: integer
+          minimum: 0
+          description: Number of course resources identified in the upload
+        courses_added:
+          type: integer
+          minimum: 0
+          description: Number of new course resources created
+        courses_modified:
+          type: integer
+          minimum: 0
+          description: Number of existing course resources updated
+        sections_seen:
+          type: integer
+          minimum: 0
+          description: Number of section resources identified in the upload
+        sections_added:
+          type: integer
+          minimum: 0
+          description: Number of new section resources created
+        sections_modified:
+          type: integer
+          minimum: 0
+          description: Number of existing section resources updated
+    FacilitiesUploadStats:
+      type: object
+      description: Statistics for a `facilities` upload job.
+      properties:
+        buildings_added:
+          type: integer
+          minimum: 0
+          description: Number of new building resources created
+        buildings_modified:
+          type: integer
+          minimum: 0
+          description: Number of existing building resources updated
+        rooms_added:
+          type: integer
+          minimum: 0
+          description: Number of new room resources created
+        rooms_modified:
+          type: integer
+          minimum: 0
+          description: Number of existing room resources updated
+    Section:
+      type: object
+      properties:
+        id:
+          type: string
+          readOnly: true
+        instructor:
+          description: The instructor's full name.
+          example: smith, john will
+          type: string
+        year:
+          type: integer
+          minimum: 1900
+          maximum: 2099
+          description: The year in which the section was offered.
+        avg:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: The average grade of students enroled in the section.
+        pass:
+          type: integer
+          minimum: 0
+          description: The number of students in the section who achieved a passing grade.
+        fail:
+          type: integer
+          minimum: 0
+          description: The number of students in the section who did not achieve a passing grade.
+        audit:
+          type: integer
+          minimum: 0
+          description: The number of students in the section who audited the course.
+        links:
+          type: object
+          readOnly: true
+          properties:
+            self:
+              type: string
+              format: uri-reference
+            course:
+              description: URL to the parent course
+              type: string
+              format: uri-reference
+    Building:
+      type: object
+      description: All properties are included in the response.
+      properties:
+        id:
+          type: string
+          readOnly: true
+          description: Building short name identifier.
+        name:
+          type: string
+          description: The full name of the building.
+        address:
+          type: string
+          description: The building address.
+        lat:
+          type: number
+          description: The latitude of the building.
+        lon:
+          type: number
+          description: The longitude of the building.
+        links:
+          type: object
+          readOnly: true
+          properties:
+            self:
+              type: string
+              format: uri-reference
+            rooms:
+              description: URL to the rooms endpoint for this building
+              type: string
+              format: uri-reference
+    Room:
+      type: object
+      description: All properties are included in the response.
+      properties:
+        id:
+          type: string
+          readOnly: true
+          description: Room identifier.
+        building:
+          type: string
+          description: The parent building shortname identifier.
+        number:
+          type: string
+          description: The room number. Not always a number so represented as a string.
+        type:
+          type: string
+          description: The room type.
+        furniture:
+          type: string
+          description: The room furniture description.
+        href:
+          type: string
+          description: Link to full room details.
+        seats:
+          type: integer
+          minimum: 0
+          description: The number of seats in the room.
+        links:
+          type: object
+          readOnly: true
+          properties:
+            self:
+              type: string
+              format: uri-reference
+            building:
+              description: URL to the parent building
+              type: string
+              format: uri-reference
+    NotFoundError:
+      type: object
+      properties:
+        error:
+          type: string
+          enum: ["Not found"]
+        message:
+          type: string
+          description: "Human-readable not-found message"
+    TooLargeError:
+      type: object
+      properties:
+        error:
+          type: string
+          enum: ["Too many results"]
+        message:
+          type: string
+          enum: ["Query would return more than 5000 results"]
+        limit:
+          type: integer
+          enum: [5000]
+  responses:
+    ResultTooLargeResponse:
+      description: Query produced too many results
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/TooLargeError"
+          example:
+            error: "Too many results"
+            message: "Query would return more than 5000 results"
+            limit: 5000
+  parameters:
+    CourseParam:
+      name: course
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Course identifier
+      example: cpsc310
+    SectionParam:
+      name: section
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Section identifier
+      example: 24w201
+    BuildingParam:
+      name: building
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Building identifier
+      example: DMP
+    RoomParam:
+      name: room
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Room identifier
+      example: DMP_101

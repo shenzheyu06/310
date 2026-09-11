@@ -1,0 +1,6 @@
+extends:
+  - minimal
+rules:
+  operation-operationId: off
+  security-defined: off
+  no-server-example.com: off
