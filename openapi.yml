@@ -1027,7 +1027,7 @@ paths:
 
         ```ebnf
         mfield ::= 'lat' | 'lon' | 'seats'
-        sfield ::= 'address' | 'building' | 'furniture' | 'href' | 'name' | 'number' | 'type'
+        sfield ::= 'campus' | 'address' | 'building' | 'furniture' | 'href' | 'name' | 'number' | 'type'
         ```
 
         #### Aggregation
@@ -2554,7 +2554,7 @@ components:
               format: uri-reference
     Building:
       type: object
-      description: All properties are included in the response.
+      description: Campus is optional; all other properties are included in the response.
       properties:
         id:
           type: string
@@ -2563,6 +2563,9 @@ components:
         name:
           type: string
           description: The full name of the building.
+        campus:
+          type: string
+          description: Optional campus name, extracted from the building page header when available.
         address:
           type: string
           description: The building address.

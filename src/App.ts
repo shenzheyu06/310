@@ -132,7 +132,8 @@ export async function createApp(config: AppConfig): Promise<Application> {
 			req.body.name,
 			req.body.address,
 			req.body.lat,
-			req.body.lon
+			req.body.lon,
+			req.body.campus
 		);
 		res.status(output.status).send(output.body);
 	});
@@ -174,7 +175,7 @@ const prefixBuildings = "/api/v2/buildings";
 const SECTIONS_MKEY = ["avg", "pass", "fail", "audit", "year"];
 const SECTIONS_SKEY = ["title", "dept", "code", "instructor"];
 const ROOMS_MKEY = ["lat", "lon", "seats"];
-const ROOMS_SKEY = ["address", "building", "furniture", "href", "name", "number", "type"];
+const ROOMS_SKEY = ["campus", "address", "building", "furniture", "href", "name", "number", "type"];
 const SECTIONS_KEY = [...SECTIONS_MKEY, ...SECTIONS_SKEY];
 const ROOMS_KEY = [...ROOMS_MKEY, ...ROOMS_SKEY];
 const MKEY = [...SECTIONS_MKEY, ...ROOMS_MKEY];
@@ -471,15 +472,6 @@ export class Model {
 		if (filtered.error && filtered.error !== "no filter") {
 			if (filtered.error === "not filter") filtered.error = "WHERE must be an object with at most one FILTER";
 			return errorBadRequest(filtered.error);
-		} else if (filtered.list.length > RESULT_LIMIT) {
-			return {
-				status: 413,
-				body: {
-					error: "Too many results",
-					message: "Query would return more than 5000 results",
-					limit: RESULT_LIMIT,
-				},
-			};
 		}
 		const infoArr = [];
 		if (body.query.TRANSFORMATIONS === undefined) {
@@ -499,6 +491,17 @@ export class Model {
 				}
 				infoArr.push(info);
 			}
+		}
+
+		if (infoArr.length > RESULT_LIMIT) {
+			return {
+				status: 413,
+				body: {
+					error: "Too many results",
+					message: "Query would return more than 5000 results",
+					limit: RESULT_LIMIT,
+				},
+			};
 		}
 
 		let multiplier = 1;
@@ -567,9 +570,16 @@ export class Model {
 		};
 	}
 
-	public async setBuilding(buildingId: string, name: any, address: any, lat: any, lon: any): Promise<ApiOutput> {
+	public async setBuilding(
+		buildingId: string,
+		name: any,
+		address: any,
+		lat: any,
+		lon: any,
+		campus?: any
+	): Promise<ApiOutput> {
 		await this.readBuildings();
-		const valid = validateBuildingParams(name, address, lat, lon);
+		const valid = validateBuildingParams(name, address, lat, lon, campus);
 		if (!valid.valid) {
 			return {
 				status: 422,
@@ -584,7 +594,7 @@ export class Model {
 			exist = true;
 			await this.deleteBuilding(buildingId);
 		}
-		const building = new Building(buildingId, name, address, lat, lon);
+		const building = new Building(buildingId, name, address, lat, lon, campus);
 		this.data.buildings.push(building);
 		await this.writeBuildings();
 		if (exist) {
@@ -1167,6 +1177,13 @@ class BuildingsDataset extends Dataset {
 					try {
 						const buildingJSON: parse5.DefaultTreeAdapterTypes.Document = parse5.parse(htmlString);
 
+						for (const child of buildingJSON.childNodes) {
+							const campusNode = this.searchChildForElement(child, "ubc7-campus");
+							if (campusNode !== undefined) {
+								building.first.campus = this.getTextFromNode(campusNode);
+							}
+						}
+
 						const roomsTable: ParseElement | undefined = this.findTable(buildingJSON);
 
 						if (roomsTable !== undefined && roomsTable !== null) {
@@ -1240,7 +1257,13 @@ class BuildingsDataset extends Dataset {
 	}
 
 	private buildingParamsMatch(b1: Building, b2: Building): boolean {
-		return b1.lat === b2.lat && b1.lon === b2.lon && b1.name === b2.name && b1.address === b2.address;
+		return (
+			b1.lat === b2.lat &&
+			b1.lon === b2.lon &&
+			b1.name === b2.name &&
+			b1.address === b2.address &&
+			b1.campus === b2.campus
+		);
 	}
 
 	private roomParamsMatch(r1: Room, r2: Room): boolean {
@@ -1334,6 +1357,7 @@ class BuildingsDataset extends Dataset {
 				match.first.first.address = building.address;
 				match.first.first.lat = building.lat;
 				match.first.first.lon = building.lon;
+				match.first.first.campus = building.campus;
 
 				match = this.combineRooms(match, building);
 
@@ -1690,6 +1714,7 @@ type BuildingJSONLinks = {
 	address: string;
 	lat: number;
 	lon: number;
+	campus?: string;
 	links: { self: string; rooms: string };
 };
 
@@ -1699,6 +1724,7 @@ type BuildingJSONFull = {
 	address: string;
 	lat: number;
 	lon: number;
+	campus?: string;
 	rooms: RoomJSONFull[];
 };
 
@@ -1708,6 +1734,7 @@ type BuildingJSONForDelete = {
 	address: string;
 	lat: number;
 	lon: number;
+	campus?: string;
 	rooms: number;
 };
 
@@ -1717,7 +1744,8 @@ class Building {
 		public name: string,
 		public address: string,
 		public lat: number,
-		public lon: number
+		public lon: number,
+		public campus?: string
 	) {}
 
 	public rooms: Room[] = [];
@@ -1729,6 +1757,7 @@ class Building {
 			address: this.address,
 			lat: this.lat,
 			lon: this.lon,
+			campus: this.campus,
 			links: {
 				self: `${prefixBuildings}/${this.id}`,
 				rooms: `${prefixBuildings}/${this.id}/rooms`,
@@ -1743,6 +1772,7 @@ class Building {
 			address: this.address,
 			lat: this.lat,
 			lon: this.lon,
+			campus: this.campus,
 			rooms: this.rooms.map((room) => room.getJSONFull()),
 		};
 	}
@@ -1754,12 +1784,13 @@ class Building {
 			address: this.address,
 			lat: this.lat,
 			lon: this.lon,
+			campus: this.campus,
 			rooms: this.rooms.length,
 		};
 	}
 
 	public static buildBuilding(data: Building): Building {
-		const newBuilding = new Building(data.id, data.name, data.address, data.lat, data.lon);
+		const newBuilding = new Building(data.id, data.name, data.address, data.lat, data.lon, data.campus);
 		newBuilding.rooms = data.rooms.map((room: Room) => Room.buildRoom(room, newBuilding));
 		return newBuilding;
 	}
@@ -1857,7 +1888,7 @@ class Room {
 	}
 
 	public getValue(key: string): any {
-		if (["name", "address", "lat", "lon"].includes(key)) return (this.building_obj.getJSONFull() as any)[key];
+		if (["name", "address", "lat", "lon", "campus"].includes(key)) return (this.building_obj.getJSONFull() as any)[key];
 		else return (this.getJSONFull() as any)[key];
 	}
 }
@@ -2271,16 +2302,108 @@ function includeString(str1: string | undefined, str2: string, prefix: boolean, 
 
 function ordering(a: any, b: any, fields: string[]): number {
 	for (const field of fields) {
-		let diff = 0;
-		if (SKEY.includes(field)) diff = a[field].localeCompare(b[field]);
-		else diff = a[field] - b[field];
-		if (diff !== 0) return diff;
+		let first = a[field];
+		let second = b[field];
+		let difference = 0;
+
+		if (typeof first === "string" || typeof second === "string") {
+			// Buildings without a campus are sorted like an empty string.
+			if (first === undefined || first === null) {
+				first = "";
+			}
+			if (second === undefined || second === null) {
+				second = "";
+			}
+			difference = first.localeCompare(second);
+		} else {
+			if (first === undefined || first === null) {
+				first = 0;
+			}
+			if (second === undefined || second === null) {
+				second = 0;
+			}
+			difference = first - second;
+		}
+
+		if (difference !== 0) {
+			return difference;
+		}
 	}
 	return 0;
 }
 
 function transformList(list: Section[] | Room[], transformation: { GROUP: string[]; APPLY: any[] }): any[] {
-	return [];
+	// A Map stores each group under a key made from its GROUP values.
+	const groups = new Map<string, (Section | Room)[]>();
+	for (const entry of list) {
+		const groupValues = [];
+		for (const field of transformation.GROUP) {
+			groupValues.push(entry.getValue(field));
+		}
+
+		const groupKey = JSON.stringify(groupValues);
+		const group = groups.get(groupKey);
+		if (group === undefined) {
+			groups.set(groupKey, [entry]);
+		} else {
+			group.push(entry);
+		}
+	}
+
+	const results = [];
+	for (const group of groups.values()) {
+		const result: any = {};
+		for (const field of transformation.GROUP) {
+			result[field] = group[0].getValue(field);
+		}
+
+		for (const rule of transformation.APPLY) {
+			const resultName = Object.keys(rule)[0];
+			const operation = Object.keys(rule[resultName])[0];
+			const field = rule[resultName][operation];
+			let answer = 0;
+
+			if (operation === "COUNT") {
+				const uniqueValues: any[] = [];
+				for (const entry of group) {
+					const value = entry.getValue(field);
+					if (!uniqueValues.includes(value)) {
+						uniqueValues.push(value);
+					}
+				}
+				answer = uniqueValues.length;
+			} else if (operation === "MAX") {
+				answer = group[0].getValue(field);
+				for (const entry of group) {
+					const value = entry.getValue(field);
+					if (value > answer) {
+						answer = value;
+					}
+				}
+			} else if (operation === "MIN") {
+				answer = group[0].getValue(field);
+				for (const entry of group) {
+					const value = entry.getValue(field);
+					if (value < answer) {
+						answer = value;
+					}
+				}
+			} else if (operation === "SUM" || operation === "AVG") {
+				let total = new Decimal(0);
+				for (const entry of group) {
+					total = total.plus(entry.getValue(field));
+				}
+				if (operation === "AVG") {
+					total = total.dividedBy(group.length);
+				}
+				answer = Number(total.toFixed(2));
+			}
+
+			result[resultName] = answer;
+		}
+		results.push(result);
+	}
+	return results;
 }
 
 async function validateDatasetParams(
@@ -2423,9 +2546,19 @@ function validateSearchParamsV2(body: any): { valid: boolean; fields: any } {
 	};
 }
 
-function validateBuildingParams(name: any, address: any, lat: any, lon: any): { valid: boolean; fields: any } {
+function validateBuildingParams(
+	name: any,
+	address: any,
+	lat: any,
+	lon: any,
+	campus?: any
+): { valid: boolean; fields: any } {
 	let valid = true;
 	const error: any = {};
+	if (campus !== undefined && typeof campus !== "string") {
+		error.campus = "expected a string";
+		valid = false;
+	}
 	if (name === undefined) {
 		error.name = "required but missing";
 		valid = false;
