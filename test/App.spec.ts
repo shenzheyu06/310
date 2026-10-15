@@ -4388,6 +4388,37 @@ describe("REST API v2", function () {
 		});
 	});
 
+	// Test 25v already covers IS with a section field in a facilities query.
+	const mixedDatasetFilters = [
+		{ kind: "course_offerings", operator: "LT", field: "seats", value: 100, column: "dept" },
+		{ kind: "course_offerings", operator: "GT", field: "seats", value: 100, column: "dept" },
+		{ kind: "course_offerings", operator: "EQ", field: "seats", value: 100, column: "dept" },
+		{ kind: "course_offerings", operator: "IS", field: "building", value: "DMP", column: "dept" },
+		{ kind: "facilities", operator: "LT", field: "avg", value: 80, column: "building" },
+		{ kind: "facilities", operator: "GT", field: "avg", value: 80, column: "building" },
+		{ kind: "facilities", operator: "EQ", field: "avg", value: 80, column: "building" },
+	];
+
+	for (const { kind, operator, field, value, column } of mixedDatasetFilters) {
+		it(`Test 25v WHERE: ${kind} rejects ${operator} on the other dataset's ${field} field`, async () => {
+			const res = await request(app)
+				.post("/api/v2/search")
+				.send({
+					kind,
+					query: {
+						WHERE: { [operator]: { [field]: value } },
+						OPTIONS: { COLUMNS: [column] },
+					},
+				});
+
+			expect(res).to.have.property("status", BAD_REQUEST);
+			expect(res).to.have.deep.property("body", {
+				error: "Invalid query",
+				message: "Cannot mix course_offerings and facilities fields in one query",
+			});
+		});
+	}
+
 	it("Test 25v_1: POST /api/v2/search should respond with status BAD_REQUEST and error message 'Cannot mix course_offerings and facilities fields in one query'", async () => {
 		const res = await request(app)
 			.post("/api/v2/search")
