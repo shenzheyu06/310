@@ -1,7 +1,8 @@
 import { SectionJSONFull } from "../repositories/courseRepository";
 import { Course } from "./course";
+import { Filterable } from "./Filterable";
 
-export class Section {
+export class Section implements Filterable {
 	constructor(
 		public id: string,
 		public instructor: string,
@@ -95,6 +96,10 @@ export class Section {
 			fail: this.fail,
 			audit: this.audit,
 		};
+	}
+
+	public getIdentity(): string {
+		return JSON.stringify(["section", this.course.id, this.id]);
 	}
 
 	public getValue(key: string): any {
