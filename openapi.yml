@@ -964,6 +964,8 @@ paths:
 
         **Important:** All fields used in a query must belong to the same `kind`. You cannot mix course_offerings fields with facilities fields in a single query.
 
+        `IN` accepts one sfield and a non-empty array of strings. A record matches when its field value exactly equals any string in the array (case-sensitive). Duplicate strings are allowed. Unlike `IS`, `IN` does not support wildcards: `*` is an ordinary character. It works on all sfields of both datasets and can be nested inside `AND`, `OR`, and `NOT`.
+
         #### Query Grammar
 
         The DSL grammar is defined using [EBNF](https://en.wikipedia.org/wiki/Extended_Backus–Naur_form):
@@ -974,11 +976,14 @@ paths:
         // Note: a BODY with no FILTER (i.e. WHERE:{}) matches all entries.
         BODY ::= 'WHERE:{' FILTER? '}'
 
-        FILTER ::= LOGICCOMPARISON | MCOMPARISON | SCOMPARISON | NEGATION
+        FILTER ::= LOGICCOMPARISON | MCOMPARISON | SCOMPARISON | INCOMPARISON | NEGATION
 
         LOGICCOMPARISON ::= LOGIC ':[' FILTER_LIST ']'
         MCOMPARISON ::= MCOMPARATOR ':{' mkey ':' number '}'
         SCOMPARISON ::= 'IS:{' skey ': "' [*]? inputstring [*]? '" }'  // Asterisks at the beginning or end of the inputstring should act as wildcards.
+        INCOMPARISON ::= 'IN:{' skey ':[' STRING_LIST ']}'
+        STRING_LIST ::= jsonstring | jsonstring ', ' STRING_LIST
+        jsonstring ::= ? a valid JSON string, including its surrounding quotes ? // May be empty and contain literal asterisks.
         NEGATION ::= 'NOT :{' FILTER '}'
 
         FILTER_LIST ::= '{' FILTER '}' | '{' FILTER '}, ' FILTER_LIST // comma separated list of filters containing at least one filter
@@ -1208,6 +1213,7 @@ paths:
                         "GT must be an object with one mfield of type number",
                         "EQ must be an object with one mfield of type number",
                         "IS must be an object with one sfield of type string",
+                        "IN must be an object with one sfield and a non-empty array of strings",
                         "IS asterisks can only be first or last character",
                         "Cannot mix course_offerings and facilities fields in one query",
                         "Missing GROUP in TRANSFORMATIONS",

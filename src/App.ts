@@ -2050,6 +2050,37 @@ function filterRecords<T extends Filterable>(
 			output.error = "Cannot mix course_offerings and facilities fields in one query";
 		else output.list = records.filter((record) => record.getValue(mkey) === query.EQ[mkey]);
 		return output;
+	} else if (Object.prototype.hasOwnProperty.call(query, "IN")) {
+		const error = "IN must be an object with one sfield and a non-empty array of strings";
+		const operand = query.IN;
+		if (
+			operand === null ||
+			typeof operand !== "object" ||
+			Array.isArray(operand) ||
+			Object.keys(operand).length !== 1
+		) {
+			return { error, list: [] };
+		}
+		const key = Object.keys(operand)[0];
+		const values = operand[key];
+		if (
+			!SKEY.includes(key) ||
+			!Array.isArray(values) ||
+			values.length === 0 ||
+			!values.every((value) => typeof value === "string")
+		) {
+			return { error, list: [] };
+		}
+		if (!allowedFields.includes(key)) {
+			return { error: "Cannot mix course_offerings and facilities fields in one query", list: [] };
+		}
+		return {
+			error: "",
+			list: records.filter((record) => {
+				const value = record.getValue(key);
+				return typeof value === "string" && values.includes(value);
+			}),
+		};
 	} else if (query.IS !== undefined && query.IS !== null) {
 		if (
 			typeof query.IS !== "object" ||
